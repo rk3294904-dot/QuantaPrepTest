@@ -1,0 +1,12 @@
+export const APP_NAME = 'QuantaPrep';
+export const TAGLINE = 'Practice. Analyse. Improve.';
+export const ADMIN_EMAIL = 'vk1719676@gmail.com';
+export const PAGE_SIZE = 20;
+export const LEADERBOARD_LIMIT = 50;
+export const AUTOSAVE_INTERVAL_MS = 30_000;
+export const VIOLATION_LIMIT = 3;
+export const BULK_BATCH_QUESTIONS = 250;
+export const REFERRAL_COINS = 5;
+export const PREMIUM_COST = 50;
+export const DAILY_BONUS_COINS = 2;
+export const REFERRAL_QUERY_KEY = 'ref';

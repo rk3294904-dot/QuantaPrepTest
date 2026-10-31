@@ -1,0 +1,299 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email == "vk1719676@gmail.com"
+        && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function userPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function isActiveUser() {
+      return exists(userPath()) && get(userPath()).data.blocked == false;
+    }
+
+    function isPremium() {
+      return exists(userPath()) && get(userPath()).data.isPremium == true;
+    }
+
+    function testData(testId) {
+      return get(/databases/$(database)/documents/tests/$(testId)).data;
+    }
+
+    function attemptPath(uid, testId, attemptNo) {
+      return /databases/$(database)/documents/attempts/$(uid + '_' + testId + '_' + string(attemptNo));
+    }
+
+    function attemptDeadline(attempt) {
+      return attempt.startedAt + duration.value(testData(attempt.testId).durationMinutes + 1, 'm');
+    }
+
+    function previousAttemptSubmitted(testId, attemptNo) {
+      return exists(attemptPath(request.auth.uid, testId, attemptNo - 1))
+        && get(attemptPath(request.auth.uid, testId, attemptNo - 1)).data.status == 'submitted';
+    }
+
+    function answerKeyUnlocked(testId) {
+      return signedIn()
+        && exists(attemptPath(request.auth.uid, testId, 1))
+        && get(attemptPath(request.auth.uid, testId, 1)).data.status == 'submitted';
+    }
+
+    // Categories: readable by signed-in users, managed by the admin only.
+    match /categories/{categoryId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Tests: published tests are visible to signed-in users; drafts only to the admin.
+    match /tests/{testId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.status == 'published');
+      allow create, update, delete: if isAdmin();
+
+      match /questions/{questionId} {
+        allow read: if isAdmin()
+          || (signedIn()
+            && get(/databases/$(database)/documents/tests/$(testId)).data.status == 'published'
+            && (get(/databases/$(database)/documents/tests/$(testId)).data.isPaid == false || isPremium()));
+        allow create, update, delete: if isAdmin();
+      }
+    }
+
+    // Answer keys: admin only, plus students who have a submitted first attempt.
+    match /answerKeys/{testId}/items/{questionId} {
+      allow read: if isAdmin() || answerKeyUnlocked(testId);
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Attempts: students own their attempts. Each attempt follows a strict lifecycle:
+    // create (in progress) -> autosave within the time window -> submit -> score once.
+    match /attempts/{attemptId} {
+      allow read: if signedIn()
+        && (resource.data.uid == request.auth.uid || isAdmin());
+
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+          'uid', 'testId', 'testTitle', 'totalMarks', 'attemptNo', 'startedAt', 'submittedAt',
+          'status', 'answers', 'markedForReview', 'timeSpent', 'score', 'correctCount',
+          'wrongCount', 'skippedCount', 'topicStats', 'sectionStats', 'wrongQuestionIds', 'violations'
+        ])
+        && request.resource.data.status == 'in_progress'
+        && request.resource.data.startedAt == request.time
+        && request.resource.data.submittedAt == null
+        && request.resource.data.violations == 0
+        && request.resource.data.score == null
+        && request.resource.data.attemptNo is int
+        && request.resource.data.attemptNo >= 1
+        && attemptId == request.auth.uid + '_' + request.resource.data.testId + '_' + string(request.resource.data.attemptNo)
+        && isActiveUser()
+        && testData(request.resource.data.testId).status == 'published'
+        && (testData(request.resource.data.testId).isPaid == false || isPremium())
+        && (request.resource.data.attemptNo == 1 || previousAttemptSubmitted(request.resource.data.testId, request.resource.data.attemptNo));
+
+      // Autosave while the attempt is in progress and the time window is open.
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && resource.data.status == 'in_progress'
+        && request.resource.data.status == 'in_progress'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['answers', 'markedForReview', 'timeSpent', 'violations'])
+        && request.resource.data.violations is int
+        && request.resource.data.violations >= resource.data.get('violations', 0)
+        && request.time <= attemptDeadline(resource.data);
+
+      // Final submission: happens once, stamped with the server time, inside the window.
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && resource.data.status == 'in_progress'
+        && request.resource.data.status == 'submitted'
+        && request.resource.data.submittedAt == request.time
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'submittedAt', 'answers', 'markedForReview', 'timeSpent', 'violations'])
+        && request.resource.data.violations is int
+        && request.resource.data.violations >= resource.data.get('violations', 0)
+        && request.time <= attemptDeadline(resource.data);
+
+      // Late close: once the time window has passed, the attempt can still be closed, but saved answers cannot change.
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && resource.data.status == 'in_progress'
+        && request.resource.data.status == 'submitted'
+        && request.resource.data.submittedAt == request.time
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'submittedAt', 'timeSpent', 'violations'])
+        && request.resource.data.violations is int
+        && request.resource.data.violations >= resource.data.get('violations', 0)
+        && request.time > attemptDeadline(resource.data);
+
+      // Scoring: the only write allowed after submission. It fills in the score once and cannot touch answers.
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && resource.data.status == 'submitted'
+        && resource.data.score == null
+        && request.resource.data.status == 'submitted'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'score', 'correctCount', 'wrongCount', 'skippedCount', 'topicStats', 'sectionStats', 'wrongQuestionIds'
+        ])
+        && request.resource.data.score is number
+        && request.resource.data.score >= 0
+        && request.resource.data.score <= testData(resource.data.testId).totalMarks
+        && request.resource.data.correctCount is int
+        && request.resource.data.wrongCount is int
+        && request.resource.data.skippedCount is int;
+
+      allow delete: if false;
+    }
+
+    // Users: own profile only (name and photo). Premium and blocked flags are admin-only.
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['name', 'email', 'photoURL', 'isPremium', 'blocked', 'coins', 'referralCode', 'referredBy', 'createdAt'])
+        && request.resource.data.isPremium == false
+        && request.resource.data.blocked == false
+        && request.resource.data.coins == 0
+        && request.resource.data.referredBy == null
+        && request.resource.data.email == request.auth.token.email;
+
+      // Owners can update name/photo, set referredBy once (from null), or buy premium with coins.
+      // Admins can update any field.
+      // The referral transaction increments a referrer's coins atomically alongside a create-only referral record.
+      allow update: if (isOwner(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'photoURL']))
+        || isAdmin()
+        || (
+          isOwner(uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['referredBy'])
+          && resource.data.get('referredBy', null) == null
+          && request.resource.data.referredBy is string
+        )
+        || (
+          signedIn()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['coins'])
+          && request.resource.data.coins == resource.data.get('coins', 0) + 5
+          && !exists(/databases/$(database)/documents/referrals/$(uid + '_' + request.auth.uid))
+          && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        )
+        // Buy premium with coins: deduct exactly 50 coins and flip isPremium from false to true.
+        || (
+          isOwner(uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['coins', 'isPremium'])
+          && resource.data.get('isPremium', false) == false
+          && request.resource.data.isPremium == true
+          && resource.data.get('coins', 0) is int
+          && resource.data.get('coins', 0) >= 50
+          && request.resource.data.coins == resource.data.get('coins', 0) - 50
+        )
+        // Daily bonus: owner increments own coins by exactly 2, paired with a same-day bonus doc.
+        || (
+          isOwner(uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['coins'])
+          && request.resource.data.coins == resource.data.get('coins', 0) + 2
+          && exists(/databases/$(database)/documents/dailyBonuses/$(uid + '_' + request.time.toDate().year() + '-' + request.time.toDate().month() + '-' + request.time.toDate().day()))
+        )
+        // Coupon redemption: owner flips isPremium to true (no coin change) paired with a couponRedemption doc.
+        || (
+          isOwner(uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isPremium'])
+          && resource.data.get('isPremium', false) == false
+          && request.resource.data.isPremium == true
+        );
+
+      allow delete: if false;
+    }
+
+    // Leaderboard: one entry per student, created from the first attempt only.
+    match /leaderboards/{testId}/entries/{uid} {
+      allow read: if signedIn();
+
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['name', 'photoURL', 'score', 'accuracy', 'timeTaken'])
+        && exists(attemptPath(uid, testId, 1))
+        && get(attemptPath(uid, testId, 1)).data.status == 'submitted'
+        && get(attemptPath(uid, testId, 1)).data.score == request.resource.data.score;
+
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // Referrals: one record per referrer+referred pair. Create-only; created by the referred user
+    // during signup, referencing a referrer whose referralCode matches the one entered.
+    // The id is <referrerUid>_<referredUid>, so self-referral is structurally impossible.
+    match /referrals/{referralId} {
+      allow read: if signedIn()
+        && (resource.data.referrerUid == request.auth.uid || resource.data.referredUid == request.auth.uid || isAdmin());
+
+      allow create: if signedIn()
+        && request.resource.data.referrerUid is string
+        && request.resource.data.referredUid is string
+        && request.resource.data.referredUid == request.auth.uid
+        && request.resource.data.referredUid != request.resource.data.referrerUid
+        && request.resource.data.coinsAwarded is int
+        && request.resource.data.coinsAwarded == 5
+        && request.resource.data.keys().hasOnly(['referrerUid', 'referredUid', 'referredName', 'referredEmail', 'coinsAwarded', 'createdAt'])
+        && exists(/databases/$(database)/documents/users/$(request.resource.data.referrerUid))
+        && get(/databases/$(database)/documents/users/$(request.resource.data.referrerUid)).data.referralCode is string
+        && referralId == request.resource.data.referrerUid + '_' + request.resource.data.referredUid;
+
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // Bookmarks: document id is uid_questionId, owned by the student.
+    match /bookmarks/{bookmarkId} {
+      allow read, delete: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create, update: if signedIn() && request.resource.data.uid == request.auth.uid;
+    }
+
+    // Coin transactions: readable by the owner. Created server-side via transactions
+    // alongside referral/daily-bonus/premium-purchase operations (rule permits create
+    // when the tx data uid matches the signed-in user, as all flows above do).
+    match /coinTransactions/{txId} {
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Daily bonuses: one per user per UTC day. The doc id is uid_YYYY-MM-DD.
+    match /dailyBonuses/{bonusId} {
+      allow read: if isOwner(request.auth.uid) && resource.data.uid == request.auth.uid;
+      allow create: if isOwner(request.auth.uid)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid', 'date', 'amount', 'createdAt'])
+        && request.resource.data.amount == 2;
+      allow update, delete: if false;
+    }
+
+    // Premium plans: readable by signed-in users, managed by the admin.
+    match /plans/{planId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Coupon redemptions: one per user+plan pair. Created by the user during
+    // premium coupon redemption (atomic with isPremium flip).
+    match /couponRedemptions/{redemptionId} {
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isOwner(request.auth.uid)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid', 'planId', 'couponCode', 'createdAt']);
+      allow update, delete: if false;
+    }
+
+    // Deny everything else by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
